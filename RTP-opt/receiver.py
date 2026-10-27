@@ -4,93 +4,83 @@ import sys
 
 from utils import PacketHeader, compute_checksum
 
-# Packet types
-START, END, DATA, ACK = 0, 1, 2, 3
+PKT_START, PKT_END, PKT_DATA, PKT_ACK = range(4)
+HDR_LEN = 16
 
-HEADER_SIZE = 16
+class RtpReceiver:
+    def __init__(self, ip, port, window):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind((ip, port))
+        self.window = window
+        self.active = False
+        self.next_expected = 1
+        self.stash = {}
+        self.out = sys.stdout.buffer
 
+    @staticmethod
+    def decode(raw):
+        if len(raw) < HDR_LEN:
+            return None
+        hdr, body = PacketHeader(raw[:HDR_LEN]), raw[HDR_LEN:]
+        if hdr.length != len(body):
+            return None
+        crc = hdr.checksum
+        hdr.checksum = 0
+        if compute_checksum(hdr / body) != crc:
+            return None
+        return hdr, body
 
-def log(*args):
-    """Debug output goes to stderr; stdout carries only the received message."""
-    print(*args, file=sys.stderr)
-    sys.stderr.flush()
+    def send_ack(self, seq, peer):
+        hdr = PacketHeader(type=PKT_ACK, seq_num=seq, length=0, checksum=0)
+        hdr.checksum = compute_checksum(hdr)
+        self.sock.sendto(bytes(hdr), peer)
 
+    def on_start(self, hdr, body, peer):
+        if not self.active:
+            self.active = True
+            self.next_expected = 1
+            self.stash.clear()
+            self.send_ack(1, peer)
+        elif self.next_expected == 1:
+            self.send_ack(1, peer)
 
-def make_ack(seq_num):
-    header = PacketHeader(type=ACK, seq_num=seq_num, length=0, checksum=0)
-    header.checksum = compute_checksum(header)
-    return bytes(header)
+        return False
 
+    def on_data(self, hdr, body, peer):
+        seq = hdr.seq_num
+        if seq >= self.next_expected + self.window:
+            return False
+        if seq >= self.next_expected:
+            self.stash[seq] = body
+        while self.next_expected in self.stash:
+            self.out.write(self.stash.pop(self.next_expected))
+            self.next_expected += 1
+        self.out.flush()
 
-def parse_packet(raw):
-    """Return (header, payload) if the checksum is valid, else None."""
-    if len(raw) < HEADER_SIZE:
-        return None
-    header = PacketHeader(raw[:HEADER_SIZE])
-    if header.length != len(raw) - HEADER_SIZE:
-        return None
-    payload = raw[HEADER_SIZE:]
-    received = header.checksum
-    header.checksum = 0
-    if compute_checksum(header / payload) != received:
-        return None
-    return header, payload
+        self.send_ack(seq, peer)
+        return False
 
+    def on_end(self, hdr, body, peer):
+        if hdr.seq_num != self.next_expected:
+            return False
+        self.send_ack(hdr.seq_num + 1, peer)
+        return True
 
-def receiver(receiver_ip, receiver_port, window_size):
-    """Receive one RTP connection; ACK each DATA packet individually (no cumulative ACK)."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # UDP only
-    s.bind((receiver_ip, receiver_port))
-    out = sys.stdout.buffer
-
-    connected = False
-    expected = 1          # N: next in-order seq_num
-    buffer = {}           # out-of-order packets: seq_num -> payload
-
-    while True:
-        raw, address = s.recvfrom(2048)
-        parsed = parse_packet(raw)
-        if parsed is None:
-            continue                      # bad checksum -> drop, no ACK
-        header, payload = parsed
-        seq = header.seq_num
-
-        if header.type == START:
-            if not connected:
-                connected = True
-                expected = 1
-                buffer = {}
-                s.sendto(make_ack(1), address)
-                log("[receiver] connection started")
-            elif expected == 1:
-                s.sendto(make_ack(1), address)   # repeat a lost START ACK
-            continue
-
-        if not connected:
-            continue
-
-        if header.type == DATA:
-            if seq >= expected + window_size:
-                continue                  # outside the window -> drop
-            if seq >= expected:
-                buffer[seq] = payload
-            while expected in buffer:
-                out.write(buffer.pop(expected))
-                expected += 1
-            out.flush()
-            # Individual ACK: same seq_num as the DATA packet
-            # (duplicates of already-delivered packets are ACKed again too).
-            s.sendto(make_ack(seq), address)
-
-        elif header.type == END:
-            if seq == expected:
-                s.sendto(make_ack(seq + 1), address)
-                log("[receiver] END received, exiting")
-                break
-
-    out.flush()
-    s.close()
-
+    def run(self):
+        handlers = {PKT_START: self.on_start, PKT_DATA: self.on_data, PKT_END: self.on_end}
+        finished = False
+        while not finished:
+            raw, peer = self.sock.recvfrom(2048)
+            pkt = self.decode(raw)
+            if pkt is None:
+                continue
+            hdr, body = pkt
+            handler = handlers.get(hdr.type)
+            if handler is None or (hdr.type != PKT_START and not self.active):
+                continue
+            finished = handler(hdr, body, peer)
+        self.out.flush()
+        self.sock.close()
 
 def main():
     parser = argparse.ArgumentParser()
@@ -105,8 +95,7 @@ def main():
     )
     args = parser.parse_args()
 
-    receiver(args.receiver_ip, args.receiver_port, args.window_size)
-
+    RtpReceiver(args.receiver_ip, args.receiver_port, args.window_size).run()
 
 if __name__ == "__main__":
     main()
